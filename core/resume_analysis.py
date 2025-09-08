@@ -157,13 +157,52 @@ def looks_like_resume(text: str) -> Tuple[bool, str, bool]:
     return False, "Does not match resume structure.", has_negatives
 
 
+# def sbert_similarity_percent(jd: str, resume_text: str) -> float:
+#     """
+#     Compute semantic similarity percentage between job description and resume text.
+#     """
+#     job_emb = model.encode(jd, normalize_embeddings=True)
+#     res_emb = model.encode(resume_text, normalize_embeddings=True)
+#     sim = float(util.cos_sim(job_emb, res_emb)[0][0])
+#     return round(max(0.0, min(1.0, sim)) * 100.0, 2)
+
+
+# from sentence_transformers import SentenceTransformer, util
+import threading
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+_model = None
+_model_lock = threading.Lock()
+
+def get_sbert_model() -> SentenceTransformer:
+    """
+    Lazy-loads and returns the SBERT model.
+    Thread-safe using a double-checked lock.
+    """
+    global _model
+    if _model is None:
+        with _model_lock:
+            if _model is None:  # Double-check inside lock
+                print(f"[INFO] Loading SBERT model: {MODEL_NAME}")
+                _model = SentenceTransformer(MODEL_NAME)
+    return _model
+
+
 def sbert_similarity_percent(jd: str, resume_text: str) -> float:
     """
-    Compute semantic similarity percentage between job description and resume text.
+    Compute semantic similarity percentage between job description and resume.
+    Lazily loads the SBERT model only when needed.
+
+    Args:
+        jd (str): Job description.
+        resume_text (str): Resume content.
+
+    Returns:
+        float: Similarity score (0.0 to 100.0).
     """
+    model = get_sbert_model()
     job_emb = model.encode(jd, normalize_embeddings=True)
     res_emb = model.encode(resume_text, normalize_embeddings=True)
-    sim = float(util.cos_sim(job_emb, res_emb)[0][0])
-    return round(max(0.0, min(1.0, sim)) * 100.0, 2)
+    similarity = float(util.cos_sim(job_emb, res_emb)[0][0])
+    return round(max(0.0, min(1.0, similarity)) * 100.0, 2)
 
 
