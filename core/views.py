@@ -3,66 +3,78 @@ import time
 import os
 import razorpay
 import random
-from botocore.exceptions import ClientError
-from rest_framework import viewsets, status, permissions
-from rest_framework.decorators import api_view, permission_classes, action
-from rest_framework.response import Response
-from django.contrib.auth import get_user_model
-from django.conf import settings
-from rest_framework.authtoken.models import Token
-from rest_framework.permissions import IsAuthenticated
-from django.db.models import Q
-from .models import User,Job,JobApplication
-from django.utils import timezone
-
-from .utils import generate_presigned_url
-from google.oauth2 import id_token
-# from google.oauth2 import id_token
-# from google.auth.transport import requests
-import requests 
-from google.auth.transport import requests as googleRequest
-
 import hmac
-from django.shortcuts import get_object_or_404
 import hashlib
-from rest_framework.parsers import MultiPartParser, FormParser,JSONParser
-from .utils import get_redirect_url
+import tempfile
 import uuid
-from rest_framework.views import APIView
-from django.core.cache import cache
+import requests
+from urllib.parse import urlparse
+
+from django.conf import settings
+from django.shortcuts import get_object_or_404, redirect
+from django.http import StreamingHttpResponse, HttpResponseBadRequest
+from django.views.decorators.csrf import csrf_exempt
 from django.core.mail import send_mail
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from django.db.models import Q
-# from razorpay_client import client
+from django.core.cache import cache
 from django.utils import timezone
 from datetime import timedelta
-import razorpay
-from django.shortcuts import redirect
-from django.views.decorators.csrf import csrf_exempt
-from django.conf import settings
-from django.http import HttpResponseBadRequest
-from razorpay.errors import SignatureVerificationError
-client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-from django.http import StreamingHttpResponse
+
+from rest_framework import viewsets, status, permissions
+from rest_framework.decorators import (
+    api_view, permission_classes, action
+)
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.views import APIView
+
+from botocore.exceptions import ClientError
+from botocore.client import Config
+
+from .models import User, Job, JobApplication
+from .utils import get_redirect_url
 from .resume_analysis import (
     extract_metadata_text,
     looks_like_resume,
     sbert_similarity_percent,
     extract_text_from_pdf_bytes
 )
-import tempfile
 
-def verify_signature(payment_id, subscription_id, signature, secret):
-    msg = f"{payment_id}|{subscription_id}".encode()
-    generated_signature = hmac.new(
-        key=secret.encode(),
-        msg=msg,
-        digestmod=hashlib.sha256
-    ).hexdigest()
+from google.oauth2 import id_token
+from google.auth.transport import requests as googleRequest
 
-    return hmac.compare_digest(generated_signature, signature)
-# Custom Permissions
+client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+
+# -------------------------------
+# ✅ AWS Utility
+# -------------------------------
+def generate_presigned_url(key: str, expiration=3600):
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        region_name=settings.AWS_S3_REGION_NAME,
+        config=Config(signature_version='s3v4')
+    )
+    try:
+        url = s3.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': settings.AWS_STORAGE_BUCKET_NAME, 'Key': key},
+            ExpiresIn=expiration
+        )
+        return url
+    except Exception as e:
+        print(f"Presigned URL generation error: {e}")
+        return None
+
+def extract_key_from_url(url: str) -> str:
+    """Extracts the S3 object key from a full URL."""
+    return urlparse(url).path.lstrip('/')
+
+
+# -------------------------------
+# ✅ Permissions
+# -------------------------------
 class IsOwnerOrReadOnly(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         if request.method in permissions.SAFE_METHODS:
@@ -76,17 +88,15 @@ class IsHROrAdmin(permissions.BasePermission):
 class IsAdmin(permissions.BasePermission):
     def has_permission(self, request, view):
         return request.user.is_authenticated and request.user.role == 'admin'
+
 class AllowAnyPermission(permissions.BasePermission):
-    """
-    Custom permission that always allows access.
-    Equivalent to rest_framework.permissions.AllowAny
-    """
     def has_permission(self, request, view):
         return True
 
 
-
-
+# -------------------------------
+# ✅ Resume Analysis API
+# -------------------------------
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def analyze_resumes_view(request, job_id: str) -> Response:
@@ -105,7 +115,11 @@ def analyze_resumes_view(request, job_id: str) -> Response:
         if not app.resume_url:
             continue
 
-        presigned_url = generate_presigned_url(app.resume_url)
+        # ✅ Extract resume key from full URL
+        resume_key = extract_key_from_url(app.resume_url)
+
+        # ✅ Generate fresh pre-signed URL
+        presigned_url = generate_presigned_url(resume_key)
         if not presigned_url:
             continue
 
@@ -114,10 +128,10 @@ def analyze_resumes_view(request, job_id: str) -> Response:
             response = requests.get(presigned_url)
             resume_bytes = response.content
 
-            # ✅ Extract text from in-memory bytes
+            # ✅ Extract text
             resume_text = extract_text_from_pdf_bytes(resume_bytes)
 
-            # ✅ Check if it's a valid resume
+            # ✅ Resume quality check
             is_resume, resume_note, has_neg = looks_like_resume(resume_text)
 
             if not is_resume:
@@ -131,7 +145,7 @@ def analyze_resumes_view(request, job_id: str) -> Response:
                 })
                 continue
 
-            # ✅ Calculate similarity
+            # ✅ Similarity check
             similarity = sbert_similarity_percent(job_description, resume_text)
             if has_neg:
                 similarity = max(0, similarity - 10)
@@ -150,9 +164,15 @@ def analyze_resumes_view(request, job_id: str) -> Response:
 
     return Response(analysis_results, status=200)
 
-  
-    
 
-
-
- 
+# -------------------------------
+# ✅ Utility for redirect after login
+# -------------------------------
+def get_redirect_url(role):
+    if role == 'user':
+        return '/job-seeker-dashboard'
+    elif role == 'hr':
+        return '/company-dashboard'
+    elif role == 'admin':
+        return '/admin-dashboard'
+    return '/'
